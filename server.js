@@ -3,6 +3,7 @@ require("dotenv").config();   // must run BEFORE ./llm is required
 const express = require("express");
 const { Pool } = require("pg");
 const { callLLM } = require("./llm");
+const { search } = require("./search");
 
 // `pg` also reads PGHOST / PGUSER / PGPASSWORD from the environment if you set them.
 const pool = new Pool({ database: "rag" });
@@ -179,13 +180,53 @@ app.post("/tools/:name", async (req, res) => {
  * Memory lives in a plain Map in RAM: restarting the server wipes it.
  * ------------------------------------------------------------------ */
 
+// The rule covers EVERY question, not just ones with docs attached: when
+// it only mentioned attached docs, a question with no matching docs
+// ("what do you know about swp") was answered from general knowledge.
 const SYSTEM_PROMPT =
   "You are a support assistant for a mutual-fund investing app. Be brief. " +
-  "Use the tools to look up the user's real orders - never guess or " +
-  "invent order details. If a tool returns nothing, say so.";
+  "Answer ONLY from two sources: (1) the reference documents attached to " +
+  "the user's message, and (2) the results of your tools, which look up " +
+  "the user's own orders. Never answer from your own general knowledge, " +
+  "even if you know the answer, and never describe app features that " +
+  "these sources don't mention. If neither source covers the question, " +
+  "say you don't have that information. Never guess or invent order " +
+  "details; if a tool returns nothing, say so. Greetings and small talk " +
+  "are fine.";
 
 const MAX_HISTORY = 20;   // messages kept per conversation
 const MAX_TOOL_STEPS = 5; // stop a model that keeps calling tools forever
+
+/* ---- RAG: find policy docs related to the question ---- */
+
+const RAG_LIMIT = 3;       // at most 3 chunks per question
+// Weak matches are dropped. Measured on our docs: greetings and off-topic
+// questions score 0.06-0.18, policy questions 0.56-0.79. Data questions
+// ("what is my latest sip?") score ~0.5 because they share words with the
+// docs, so they may get a harmless extra chunk - no cut-off splits those.
+const RAG_MIN_SCORE = 0.4;
+
+async function retrieveDocs(question) {
+  try {
+    return await search(question, { limit: RAG_LIMIT, minScore: RAG_MIN_SCORE });
+  } catch (err) {
+    // If Qdrant is down, still answer - just without docs.
+    console.error("doc search failed:", err.message);
+    return [];
+  }
+}
+
+// The question the LLM sees: the docs first, clearly labelled as
+// reference material, then the user's actual question.
+function withDocs(question, docs) {
+  // Say so explicitly when nothing matched - an empty search must not be
+  // silent, or the model treats it as permission to use general knowledge.
+  if (!docs.length) {
+    return `Reference from our policy documents: none matched this question.\n\nQuestion: ${question}`;
+  }
+  const refs = docs.map((d, i) => `[${i + 1}] ${d.text.replace(/\n+/g, " ")}`).join("\n");
+  return `Reference from our policy documents:\n${refs}\n\nQuestion: ${question}`;
+}
 
 const conversations = new Map(); // conversationId -> [{ role, content }, ...]
 
@@ -214,10 +255,11 @@ app.post("/chat", async (req, res) => {
   }
 
   const history = conversations.get(conversationId) ?? [];
+  const docs = await retrieveDocs(message);
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     ...history,
-    { role: "user", content: message },
+    { role: "user", content: withDocs(message, docs) },
   ];
   const toolsUsed = [];
 
@@ -260,11 +302,14 @@ app.post("/chat", async (req, res) => {
     // Memory keeps only the question and the final answer. The tool
     // messages are dropped: cheaper, and a follow-up just calls the tool
     // again, so it sees fresh data instead of a stale copy.
+    // Save the plain question, not the version with docs pasted in -
+    // otherwise every turn stores another copy of the docs.
     history.push({ role: "user", content: message });
     history.push({ role: "assistant", content: reply });
     conversations.set(conversationId, history.slice(-MAX_HISTORY));
 
-    res.json({ reply, toolsUsed, conversationId });
+    const sources = docs.map((d) => ({ source: d.source, section: d.section, score: d.score }));
+    res.json({ reply, sources, toolsUsed, conversationId });
   } catch (err) {
     console.error("llm failed:", err.message);
     res.status(500).json({ error: "llm failed", detail: err.message });
